@@ -1,0 +1,10 @@
+*.zip
+*.pbix
+venv
+Yelp-JSON
+archive
+census
+*.csv
+florida_tracts
+yelp_dataset
+yelp_dataset_parquet
