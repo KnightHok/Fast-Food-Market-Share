@@ -8,3 +8,6 @@ census
 florida_tracts
 yelp_dataset
 yelp_dataset_parquet
+.env
+__pycache__
+*.xlsx
