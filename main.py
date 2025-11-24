@@ -9,6 +9,8 @@ import httpx
 import asyncpg
 from dotenv import load_dotenv
 
+from processor import fetch_and_export_run
+
 load_dotenv(".env")
 
 # -----------------------
@@ -104,7 +106,7 @@ async def start_run(payload: StartRunInput, request: Request):
             webhook_url = f"{scheme}://{host}/apify/webhook"
 
     # Build the request payload
-    run_payload = {"input": payload.input}
+    run_payload = payload.input.copy() if isinstance(payload.input, dict) else {}
 
     # Only add webhook if we have a valid URL
     if webhook_url:
@@ -225,4 +227,61 @@ async def apify_webhook(request: Request):
 
     return {"ok": True}
 
+@app.post("/runs/{run_id}/export")
+async def export_run(run_id: str, request: Request):
+    """
+    Manually trigger export for a specific run.
+    Fetches dataset, stores in DB, and exports to CSV.
+    """
 
+    # Check if we have the run in memory
+    run_info = RUNS.get(run_id)
+
+    # If not in memory or no dataset_id, fetch from Apify API
+    if not run_info or not run_info.get("datasetId"):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    headers={"Authorization": f"Bearer {APIFY_TOKEN}"}
+                )
+                resp.raise_for_status()
+                data = resp.json()["data"]
+
+                run_info = {
+                    "status": data["status"],
+                    "datasetId": data.get("defaultDatasetId")
+                }
+                RUNS[run_id] = run_info
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Apify API error: {str(e)}")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Run not found")
+        
+    # Check if run succeeded
+    if run_info["status"] != "SUCCEEDED":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run status is {run_info['status']}, must be SUCCEEDED to export"
+        )
+    
+    dataset_id = run_info.get("datasetId")
+    if not dataset_id:
+        raise HTTPException(status_code=400, detail="Run has no dataset")
+    
+    # Import and use processor
+    try:
+        result = await fetch_and_export_run(
+            run_id=run_id,
+            dataset_id=dataset_id,
+            output_folder="exports",
+            db_pool=request.app.state.db_pool,
+            store_in_db=True,
+            filter_fast_food=True
+        )
+        if result["success"]:
+            return result
+        else:
+            raise HTTPException(status_code=500, detail=result.get("error"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
