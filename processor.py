@@ -110,7 +110,7 @@ async def store_in_database(items: List[Dict[str, Any]], run_id: str, db_pool) -
                 run_id,
                 item.get("bizId"),
                 item.get("name"),
-                year_established,
+                int(year_established) if year_established else -1,
                 item.get("aggregatedRating"),
                 address_line1,
                 address_line2,
