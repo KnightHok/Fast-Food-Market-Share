@@ -103,8 +103,7 @@ async def store_in_database(items: List[Dict[str, Any]], run_id: str, db_pool) -
                         category_3 = EXCLUDED.category_3,
                         health_score = EXCLUDED.health_score,
                         cuisine = EXCLUDED.cuisine,
-                        direct_url = EXCLUDED.direct_url,
-                        created_at = NOW()
+                        direct_url = EXCLUDED.direct_url
                     RETURNING (xmax = 0) AS inserted
                 """,
                 run_id,
@@ -126,7 +125,7 @@ async def store_in_database(items: List[Dict[str, Any]], run_id: str, db_pool) -
                 item.get("directUrl")
                 )
 
-                if result == "INSERT 0 1":
+                if result["inserted"]:
                     inserted += 1
                 else:
                     updated += 1

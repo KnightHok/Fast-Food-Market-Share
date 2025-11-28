@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request, Body
 from pydantic import BaseModel
 import httpx
 import asyncpg
+import asyncio
 from dotenv import load_dotenv
 
 from processor import fetch_and_export_run
@@ -75,6 +76,11 @@ class RunStatus(BaseModel):
     run_id: str
     status: str
     dataset_id: Optional[str] = None
+
+class BatchRunInput(BaseModel):
+    input: Dict[str, Any] = {}
+    batch_size: int = 10
+    delay_between_batches: int = 2 # seconds
 
 
 # -----------------------
@@ -154,6 +160,124 @@ async def start_run(payload: StartRunInput, request: Request):
     }
 
     return RunStatus(run_id=run_id, status=status, dataset_id=dataset_id)
+
+@app.post("/runs/batch-start")
+async def batch_start_runs(payload: BatchRunInput, request: Request):
+    """
+    Start multiple Apify runs in batches for a list of cities.
+    Returns list of started run IDs.
+    """
+    # Extract the full input
+    actor_input = payload.input.copy()
+
+    # Get the search strings array (list of cities)
+    location_strings = actor_input.get("locations", [])
+
+    if not location_strings:
+        raise HTTPException(status_code=400, detail="locations in required in input")
+    
+    batch_size = payload.batch_size
+
+    # split cities into batches
+    batches = [location_strings[i:i + batch_size] for i in range(0, len(location_strings), batch_size)]
+
+    started_runs = []
+
+    for i, batch in enumerate(batches):
+        print(f"Starting batch {i+1}/{len(batches)} with {len(batch)} cities...")
+
+        # Build webhook url
+        webhook_url = None
+        scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+        host = request.headers.get("X-Forwarded-Host", request.headers.get("host"))
+
+        if host and "localhost" not in host and "127.0.0.1" not in host:
+            webhook_url = f"{scheme}://{host}/apify/webhook"
+        
+        # Build run payload for this batch
+        run_payload = actor_input.copy()
+        run_payload["locations"] = batch
+
+        # Add webhook if available
+        if webhook_url:
+            webhook_def = {
+                "eventTypes": [
+                    "ACTOR.RUN.SUCCEEDED",
+                    "ACTOR.RUN.FAILED",
+                    "ACTOR.RUN.TIMED_OUT",
+                    "ACTOR.RUN.ABORTED",
+                ],
+                "requestUrl": webhook_url,
+                "headers": [
+                    {"name": "X-Webhook-Secret", "value": APIFY_WEBHOOK_SECRET}
+                ],
+            }
+            run_payload["webhooks"] = [webhook_def]
+        # start the run
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs",
+                    headers={
+                        "Authorization": f"Bearer {APIFY_TOKEN}",
+                        "Content-Type": "application/json"
+                    },
+                    json=run_payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()["data"]
+
+                run_id = data["id"]
+                status = data["status"]
+                dataset_id = data.get("defaultDatasetId")
+
+                # save in memory
+                RUNS[run_id] = {
+                    "status": status,
+                    "datasetId": dataset_id,
+                    "batch_number": i + 1,
+                    "search_count": len(batch)
+                }
+                
+                started_runs.append({
+                    "batch": i + 1,
+                    "search_count": len(batch),
+                    "run_id": run_id,
+                    "status": status,
+                    "dataset_id": dataset_id
+                })
+
+                print(f"✅ Batch {i+1} started: {run_id}")
+        except httpx.HTTPError as e:
+            error_msg = f"Apify API error: {str(e)}"
+            print(f"✗ Batch {i+1} failed: {error_msg}")
+            started_runs.append({
+                "batch": i + 1,
+                "search_count": len(batch),
+                "error": error_msg,
+                "failed": True
+            })
+        except KeyError:
+            error_msg = "Unexpected response from Apify API"
+            print(f"✗ Batch {i+1} failed: {error_msg}")
+            started_runs.append({
+                "batch": i + 1,
+                "search_count": len(batch),
+                "error": error_msg,
+                "failed": True
+            })
+        
+        # delay between batches (except after last batch)
+        if i < len(batches) - 1:
+            await asyncio.sleep(payload.delay_between_batches)
+
+    return {
+        "message": "Batch runs started successfully",
+        "total_locations": len(location_strings),
+        "total_batches": len(batches),
+        "batch_size": batch_size,
+        "runs": started_runs
+    }
 
 @app.get("/runs/{run_id}", response_model=RunStatus)
 async def get_run_status(run_id: str, refresh: bool = False):
